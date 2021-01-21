@@ -1,0 +1,137 @@
+------------------------------------------------------------------------------------------
+--Create view "meta21" with nearest logger ID from this year to 2020 and 2019 
+--as new attributes
+------------------------------------------------------------------------------------------
+DROP VIEW IF EXISTS meta21;
+CREATE VIEW meta21 AS
+WITH meta21 AS (
+	SELECT *, 
+	(SELECT id FROM metadata ly WHERE term_id=9 ORDER BY st_distance(m.location, ly.location) ASC LIMIT 1) as close_meta20_id,
+	(SELECT id FROM metadata ly WHERE term_id=7 ORDER BY st_distance(m.location, ly.location) ASC LIMIT 1) as close_meta19_id
+	FROM metadata m
+	WHERE term_id=11 AND sensor_id=1
+	);
+
+------------------------------------------------------------------------------------------
+--Create view "data_norm" with normalized mean temperature values, which are later needed
+--to calculate the correlation
+------------------------------------------------------------------------------------------
+DROP VIEW IF EXISTS data_norm;
+CREATE VIEW data_norm AS
+-- From here, it's only a single SQL statement
+SELECT
+	row_number() OVER (PARTITION BY meta_id, variable_id ORDER BY tstamp ASC) as measurement_index,
+	*,
+	value - avg(value) OVER (PARTITION BY meta_id, variable_id) AS norm,
+	avg(value) OVER (PARTITION BY meta_id, variable_id) AS group_avg	
+FROM data;
+
+------------------------------------------------------------------------------------------
+--Create table "indices_final" in which first indices (t_ag, t_d, t_n, t_nd) are created in 
+--one sub-query for each index
+------------------------------------------------------------------------------------------
+DROP TABLE IF EXISTS indices_final CASCADE;
+CREATE TABLE indices_final AS
+SELECT
+    mean_total.device_id, mean_total.t_avg,
+    mean_d.t_d,
+    mean_n.t_n,
+    (t_d - t_n) as t_nd
+FROM
+
+--sub-query for mean temperature (just for 2021, term_id = 11):
+(
+SELECT 
+    device_id,
+    avg(d.value) as t_avg  
+FROM data d
+JOIN metadata m ON m.id=d.meta_id
+WHERE m.term_id = 11
+GROUP BY m.device_id
+) as mean_total	
+
+JOIN
+
+--sub-query for mean temperature during daytime (just for 2021, term_id = 11):
+(
+SELECT 
+    device_id,
+    avg(d.value) as t_d  
+FROM data d
+JOIN metadata m ON m.id=d.meta_id
+WHERE d.variable_id=1 AND m.term_id = 11
+AND EXTRACT(HOUR FROM d.tstamp) >= 6 
+AND EXTRACT(HOUR FROM d.tstamp) < 18
+GROUP BY m.device_id
+) as mean_d
+
+ON mean_total.device_id=mean_d.device_id
+
+JOIN
+
+--sub-query for mean temperature during nighttime (just for 2021, term_id = 11):
+(
+SELECT 
+    device_id,
+    avg(d.value) as t_n  
+FROM data d
+JOIN metadata m ON m.id=d.meta_id
+WHERE d.variable_id=1 AND m.term_id = 11
+AND (EXTRACT(HOUR FROM d.tstamp) < 6 
+OR EXTRACT(HOUR FROM d.tstamp) >= 18)
+GROUP BY m.device_id
+) as mean_n
+
+ON mean_d.device_id=mean_n.device_id
+
+------------------------------------------------------------------------------------------
+--Create new view "all_inidces" in which the two correlation attributes from 2020 and 2019 
+--are created in two additional sub-queries and added to the table "indices_final"
+------------------------------------------------------------------------------------------
+DROP VIEW IF EXISTS all_indices CASCADE;
+CREATE VIEW all_indices AS
+SELECT 
+    indices_final.device_id,
+    indices_final.t_avg, indices_final.t_d, 
+    indices_final.t_n, indices_final.t_nd,
+    corr_1.corr_20,
+    corr_2.corr_19
+FROM
+indices_final 
+
+JOIN
+
+--sub-query fot correlation of indices between 2021 and 2020:
+(  
+	SELECT 
+		meta21.id, 											
+		corr(d.norm, d20.norm) AS "corr_20", 
+        m.device_id		
+	FROM data_norm d													
+	JOIN meta21 on meta21.id = d.meta_id		
+	JOIN metadata m20 on meta21.close_meta20_id=m20.id
+    JOIN data_norm d20 on m20.id=d20.meta_id AND d.measurement_index=d20.measurement_index
+    JOIN metadata m on m.id=d.meta_id
+	GROUP BY meta21.id, m.device_id
+) as corr_1
+
+ON corr_1.device_id=indices_final.device_id
+
+JOIN
+
+sub-query fot correlation of indices between 2021 and 2019:
+ (
+     SELECT 
+		meta21.id, 												
+		corr(d.norm, d20.norm) AS "corr_19", 
+        m.device_id		
+	FROM data_norm d													
+	JOIN meta21 on meta21.id = d.meta_id		
+	JOIN metadata m20 on meta21.close_meta19_id=m20.id
+    JOIN data_norm d20 on m20.id=d20.meta_id AND d.measurement_index=d20.measurement_index
+    JOIN metadata m on m.id=d.meta_id
+	GROUP BY meta21.id, m.device_id
+) as corr_2
+ 
+
+ON corr_2.device_id=corr_1.device_id
